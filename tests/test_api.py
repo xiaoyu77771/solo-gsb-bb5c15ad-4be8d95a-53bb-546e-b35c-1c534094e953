@@ -859,6 +859,283 @@ def test_carrier_exclusion_ranges_does_not_save_analysis(client):
     assert client.get("/sites/1/analyses").json() == []
 
 
+# ---------------------------------------------------------------- 单载频迁移规划
+
+def _brute_force_relocation(carriers, scan, guard_bands, g, old_hz, lo, hi):
+    """逐 Hz 枚举参考：返回距 old_hz 最近的可行频率（等距取小），无则 None。"""
+    scan_start, scan_end = scan
+    best = None
+    for x in range(lo, hi + 1):
+        new_carriers = [c for c in carriers if c != old_hz] + [x]
+        if len(set(new_carriers)) != len(new_carriers):
+            continue
+        ok = True
+        for fa in new_carriers:
+            for fb in new_carriers:
+                if fa == fb:
+                    continue
+                p = 2 * fa - fb
+                if not (scan_start <= p <= scan_end):
+                    continue
+                dists = [abs(p - c) for c in new_carriers]
+                for band in guard_bands:
+                    if band["start_hz"] <= p <= band["end_hz"]:
+                        dists.append(0)
+                    else:
+                        dists.append(min(abs(p - band["start_hz"]), abs(p - band["end_hz"])))
+                if min(dists) < g:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok and (
+            best is None
+            or abs(x - old_hz) < abs(best - old_hz)
+            or (abs(x - old_hz) == abs(best - old_hz) and x < best)
+        ):
+            best = x
+    return best
+
+
+def test_carrier_relocation_returns_old_position_when_still_feasible(client):
+    # 单载频 1000、g=10：old 本身可行（无任何产物），返回 old_hz，不修改站点
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000], scan_end_hz=100000, guard_interval_hz=10,
+    ))
+    resp = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 1000, "start_hz": 1, "end_hz": 100000,
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "site_id": 1,
+        "old_hz": 1000,
+        "start_hz": 1,
+        "end_hz": 100000,
+        "feasible": True,
+        "new_hz": 1000,
+    }
+    # 站点未被修改
+    assert client.get("/sites/1").json()["carriers_hz"] == [1000]
+
+
+def test_carrier_relocation_takes_smaller_on_equidistance(client):
+    # 载频 [100,300,500]、g=50，迁移 100 -> x。未变来源 (300,500)->100 落在
+    # 扫描范围内且到 300/500 均不小于 50，但会命中近 100 的新载频 x：
+    # |100-x|<50 -> x∈[51,149] 禁用。候选 [1,1000] 中 50 与 150 到 old=100
+    # 等距（均为 50），取较小者 50。
+    client.post("/sites", json=make_payload(
+        carriers_hz=[100, 300, 500], scan_end_hz=10000, guard_interval_hz=50,
+    ))
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 1, "end_hz": 1000,
+    }).json()
+    assert body["feasible"] is True
+    assert body["new_hz"] == 50
+    # 仅右側空隙时取 150
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 150, "end_hz": 200,
+    }).json()
+    assert body["new_hz"] == 150
+
+
+def test_carrier_relocation_zone_inversion_formula_products(client):
+    # 载频 [1000, 2000, 3500]、g=50，迁移 1000 -> x。含 x 产物 2*x-c
+    # （c=3500）落在扫描范围内且到 2000 距离 <50 时禁用：
+    # |2*x-3500-2000|<50 -> 2*x∈(5450,5550) -> x∈[2726,2774]
+    # （除以 2 的开区间整数点内缩后向上/下取整）。候选 [2700,2900] 中
+    # 距 1000 最近的可行点为 2700；候选整体落入禁用区 [2726,2774] 时无解。
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 2000, 3500], scan_end_hz=10000, guard_interval_hz=50,
+    ))
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 1000, "start_hz": 2700, "end_hz": 2900,
+    }).json()
+    assert body["feasible"] is True
+    assert body["new_hz"] == 2700
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 1000, "start_hz": 2726, "end_hz": 2774,
+    }).json()
+    assert body["feasible"] is False
+    assert body["new_hz"] is None
+    # 开边界：距离恰好 50 的两侧 2725、2775 可行
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 1000, "start_hz": 2725, "end_hz": 2725,
+    }).json()
+    assert body["new_hz"] == 2725
+
+
+def test_carrier_relocation_unchanged_product_hitting_x_forbids_zone(client):
+    # 明确的 A2 用例：载频 [100, 2000, 3000]、g=50，迁移 100 -> x。
+    # 未变来源 (2000,3000)->1000，扫描范围内且到 2000 距离 1000>=50、
+    # 到 3000 距离 2000>=50，本身不违规，但 |1000-x|<50 时命中新载频 x，
+    # 故 x∈[951,1049] 禁用。候选 [900,1100] 中距 100 最近的可行点为 900。
+    client.post("/sites", json=make_payload(
+        carriers_hz=[100, 2000, 3000], scan_end_hz=10000, guard_interval_hz=50,
+    ))
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 900, "end_hz": 1100,
+    }).json()
+    assert body == {
+        "site_id": 1,
+        "old_hz": 100,
+        "start_hz": 900,
+        "end_hz": 1100,
+        "feasible": True,
+        "new_hz": 900,
+    }
+    # 候选整体落入禁用区间 -> 无解
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 960, "end_hz": 1040,
+    }).json()
+    assert body["feasible"] is False
+    assert body["new_hz"] is None
+
+
+def test_carrier_relocation_infeasible_when_unchanged_product_violates_fixed_object(client):
+    # 载频 [100,300,400]、保护频段 [480,520]、g=150：迁移 100 后，未变来源
+    # (400,300)=500 仍落在保护频段内（距离 0<150），与 x 无关，全局无解。
+    client.post("/sites", json=make_payload())
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 1, "end_hz": 10000,
+    }).json()
+    assert body == {
+        "site_id": 1,
+        "old_hz": 100,
+        "start_hz": 1,
+        "end_hz": 10000,
+        "feasible": False,
+        "new_hz": None,
+    }
+    # 站点未被修改，也没有保存分析
+    assert client.get("/sites/1").json()["carriers_hz"] == [100, 300, 400]
+    assert client.get("/sites/1/analyses").json() == []
+
+
+def test_carrier_relocation_duplicate_position_rejected(client):
+    # g=0 时产物均不违规，唯一禁用位置是其余载频点：候选退化为单点 300（重复）
+    client.post("/sites", json=make_payload(guard_interval_hz=0))
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 300, "end_hz": 300,
+    }).json()
+    assert body["feasible"] is False
+    assert body["new_hz"] is None
+    # 避开重复点后 old 本身可行
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 1, "end_hz": 10000,
+    }).json()
+    assert body["feasible"] is True
+    assert body["new_hz"] == 100
+
+
+def test_carrier_relocation_open_boundary_strict_guard_interval(client):
+    # 开边界：距离恰好等于 g 不违规。载频 [100,2000]、g=10，候选含边界
+    # 990（|2*x-2000|=20 不违规；x=991 时 |2*x-2000|=18 ...）按暴力参考核对
+    client.post("/sites", json=make_payload(
+        carriers_hz=[100, 2000], scan_end_hz=10000, guard_interval_hz=10,
+    ))
+    body = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 985, "end_hz": 1015,
+    }).json()
+    expect = _brute_force_relocation(
+        [100, 2000], (1, 10000), [], 10, 100, 985, 1015
+    )
+    assert body["new_hz"] == expect
+
+
+def test_carrier_relocation_404_missing_site(client):
+    resp = client.post("/sites/999/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 1, "end_hz": 1000,
+    })
+    assert resp.status_code == 404
+
+
+def test_carrier_relocation_422_old_carrier_missing(client):
+    client.post("/sites", json=make_payload())
+    resp = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 999, "start_hz": 1, "end_hz": 1000,
+    })
+    assert resp.status_code == 422
+    assert "old_hz" in resp.json()["detail"]
+    # 站点不存在优先返回 404（old_hz 是否存在均不检查）
+    assert client.post("/sites/999/carrier-relocation", json={
+        "old_hz": 999, "start_hz": 1, "end_hz": 1000,
+    }).status_code == 404
+
+
+def test_carrier_relocation_422_invalid_interval_and_fields(client):
+    client.post("/sites", json=make_payload())
+    url = "/sites/1/carrier-relocation"
+    for bad in (
+        {"start_hz": 100, "end_hz": 1},       # 起点大于终点
+        {"old_hz": 0, "start_hz": 1, "end_hz": 100},    # old 非正
+        {"old_hz": 100, "start_hz": 0, "end_hz": 100},  # 起点非正
+        {"old_hz": 100, "start_hz": 1, "end_hz": 0},    # 终点非正
+        {"old_hz": "abc", "start_hz": 1, "end_hz": 100},
+        {"old_hz": 100, "start_hz": 1.5, "end_hz": 100},
+        {"start_hz": 1, "end_hz": 100},       # 缺 old_hz
+        {"old_hz": 100, "end_hz": 100},       # 缺 start_hz
+        {"old_hz": 100, "start_hz": 1},       # 缺 end_hz
+        {},                                    # 空请求体
+    ):
+        resp = client.post(url, json=bad)
+        assert resp.status_code == 422, bad
+    # 起点等于终点合法（闭区间退化单点）；该点恰好是重复载频 -> 200 无解
+    ok = client.post(url, json={"old_hz": 100, "start_hz": 300, "end_hz": 300})
+    assert ok.status_code == 200
+    assert ok.json()["feasible"] is False
+
+
+def test_carrier_relocation_does_not_modify_site_or_save_analysis(client):
+    client.post("/sites", json=make_payload())
+    before = client.get("/sites/1").json()
+    resp = client.post("/sites/1/carrier-relocation", json={
+        "old_hz": 100, "start_hz": 1, "end_hz": 10000,
+    })
+    assert resp.status_code == 200
+    assert client.get("/sites/1").json() == before
+    assert client.get("/sites/1/analysis").status_code == 404
+    assert client.get("/sites/1/analyses").json() == []
+
+
+def test_carrier_relocation_matches_brute_force_random_cases(client):
+    # 端到端：随机小参数下与逐 Hz 枚举参考完全一致（含等距取小、无解、A1/A2）
+    import random
+
+    rng = random.Random(20260923)
+    site_no = 0
+    for _ in range(60):
+        site_no += 1
+        carriers = sorted(rng.sample(range(50, 800), rng.randint(1, 4)))
+        scan_start = rng.randint(1, 200)
+        scan_end = scan_start + rng.randint(50, 1500)
+        g = rng.choice([0, 1, 5, 20, 80])
+        bands = [
+            {"start_hz": rng.randint(100, 600), "end_hz": rng.randint(601, 900)}
+            for _ in range(rng.randint(0, 1))
+        ]
+        client.post("/sites", json=make_payload(
+            name=f"site-{site_no}",
+            carriers_hz=carriers,
+            scan_start_hz=scan_start,
+            scan_end_hz=scan_end,
+            guard_interval_hz=g,
+            guard_bands=bands,
+        ))
+        old_hz = rng.choice(carriers)
+        lo = rng.randint(1, 700)
+        hi = lo + rng.randint(0, 400)
+        resp = client.post(f"/sites/{site_no}/carrier-relocation", json={
+            "old_hz": old_hz, "start_hz": lo, "end_hz": hi,
+        })
+        assert resp.status_code == 200, resp.text
+        expected = _brute_force_relocation(
+            carriers, (scan_start, scan_end), bands, g, old_hz, lo, hi
+        )
+        body = resp.json()
+        assert body["feasible"] is (expected is not None)
+        assert body["new_hz"] == expected
+
+
 
 
 def _create_and_analyze(client, **payload_overrides):

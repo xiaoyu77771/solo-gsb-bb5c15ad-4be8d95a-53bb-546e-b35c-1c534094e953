@@ -206,6 +206,42 @@ class CarrierExclusionResult(BaseModel):
     )
 
 
+# ------------------------------------------------ 单载频迁移规划
+
+class CarrierRelocationRequest(BaseModel):
+    """单载频迁移请求：把 old_hz 替换为候选闭区间内的某个整数频率。"""
+
+    old_hz: int = Field(..., gt=0, description="待替换载频，须为站点现有载频，正整数 Hz")
+    start_hz: int = Field(..., gt=0, description="候选整数闭区间起点（含），正整数 Hz")
+    end_hz: int = Field(..., gt=0, description="候选整数闭区间终点（含），正整数 Hz")
+
+    @model_validator(mode="after")
+    def _check_order(self) -> "CarrierRelocationRequest":
+        if self.end_hz < self.start_hz:
+            raise ValueError("end_hz must not be less than start_hz")
+        return self
+
+
+class CarrierRelocationResult(BaseModel):
+    """单载频迁移规划结果：不修改站点也不保存分析。"""
+
+    site_id: int
+    old_hz: int = Field(..., description="待替换载频，整数 Hz")
+    start_hz: int = Field(..., description="候选闭区间起点（含），整数 Hz")
+    end_hz: int = Field(..., description="候选闭区间终点（含），整数 Hz")
+    feasible: bool = Field(
+        ..., description="候选闭区间内是否存在满足全部判定的整数位置"
+    )
+    new_hz: int | None = Field(
+        ...,
+        description=(
+            "距 old_hz 最近的可行频率，等距时取较小值；feasible=false 时为 null。"
+            "迁移后方案的全部三阶产物（含未变来源产生的产物）均不违反保护间隔，"
+            "且 new_hz 不与其余载频重复"
+        ),
+    )
+
+
 # ------------------------------------------------ 载频漂移风险评估
 
 class CarrierTolerance(BaseModel):

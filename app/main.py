@@ -15,12 +15,15 @@ from .analysis import (
     build_risk_history,
     carrier_exclusion_ranges,
     drift_risk_assessment,
+    plan_carrier_relocation,
 )
 from .schemas import (
     AnalysisMeta,
     AnalysisResult,
     BatchAnalysisRequest,
     CarrierExclusionResult,
+    CarrierRelocationRequest,
+    CarrierRelocationResult,
     CrossSiteConflictsRequest,
     CrossSiteConflictsResponse,
     DriftRiskRequest,
@@ -129,6 +132,54 @@ def get_carrier_exclusion_ranges(
         candidate_end_hz=candidate_end_hz,
         exclusion_ranges=ranges,
     )
+
+
+@app.post(
+    "/sites/{site_id}/carrier-relocation",
+    response_model=CarrierRelocationResult,
+    tags=["sites"],
+    summary="单载频迁移规划：在候选整数闭区间内求距待替换载频最近的可行频率（不修改站点、不保存分析）",
+    description=(
+        "请求体给出待替换载频 `old_hz`（须为站点现有载频，否则 422）与候选"
+        "整数闭区间 `[start_hz, end_hz]`（正整数且起点不大于终点，否则 422；"
+        "站点不存在 → 404）。把 `old_hz` 替换为候选位置 `x` 后，按与分析"
+        "完全相同的语义判定：迁移后载频集合（其余载频 ∪ {x}）的全部有序"
+        "来源三阶产物 `2·fa−fb`（fa≠fb）落在扫描范围内时，到任一载频"
+        "（含新载频 x 自身）或保护频段的距离严格小于 guard_interval_hz 即"
+        "违规；仅当**全部产物均不违规且 x 不与其余载频重复**时该位置可接受。\n\n"
+        "判定**反解关于 x 的线性约束并合并为禁用整数闭区间**（除以 2 时取整、"
+        "开区间整数点内缩 1 Hz），在合并后区间的空隙中选解，**不逐 Hz 枚举**；"
+        "同时计入**未变来源（其余载频两两）的产物命中新载频 x** 的情况，以及"
+        "未变来源产物命中其余载频/保护频段导致的全局无解。返回距 `old_hz` "
+        "最近的可行频率，**等距时取较小值**；候选区间内无可行位置时 "
+        "`feasible=false`、`new_hz=null`。接口为纯计算：不修改站点，也不"
+        "执行或保存任何分析。"
+    ),
+)
+def relocate_carrier(
+    site_id: int, payload: CarrierRelocationRequest
+) -> CarrierRelocationResult:
+    site = database.fetch_site(site_id)
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
+    if payload.old_hz not in site.carriers_hz:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"old_hz {payload.old_hz} is not a carrier of site {site_id}",
+        )
+    result = plan_carrier_relocation(
+        carriers_hz=site.carriers_hz,
+        scan_start_hz=site.scan_start_hz,
+        scan_end_hz=site.scan_end_hz,
+        guard_bands=site.guard_bands,
+        guard_interval_hz=site.guard_interval_hz,
+        old_hz=payload.old_hz,
+        start_hz=payload.start_hz,
+        end_hz=payload.end_hz,
+        site_id=site_id,
+    )
+    assert result is not None  # old_hz 已在上方校验
+    return result
 
 
 @app.post(

@@ -108,6 +108,69 @@ docker compose up --build
 }
 ```
 
+## 单载频迁移规划（carrier relocation）
+
+`POST /sites/{site_id}/carrier-relocation` 把指定载频 `old_hz` 替换为候选整数闭区间
+`[start_hz, end_hz]` 内的某个位置 `x`，**不修改站点、不执行也不保存分析**。
+请求体字段均为正整数且 `start_hz ≤ end_hz`（缺失、非正、非整数或起点大于终点 → `422`）；
+`old_hz` 不是该站点现有载频 → `422`；站点不存在 → `404`。
+
+- **可接受判定**：迁移后载频集合为"其余载频 ∪ {x}"，按与分析**完全相同**的语义枚举其全部
+  有序来源三阶产物 `2·fa − fb`（`fa ≠ fb`）：落在扫描范围内的产物到任一载频（**含新载频
+  x 自身**）或保护频段的距离**严格小于** `guard_interval_hz` 即违规。仅当**全部产物均不违规**
+  且 **x 不与其余载频重复**时，该位置才可接受。
+- **计入未变来源的产物**：由其余载频两两产生的产物不再依赖 `old_hz`——若它命中其余载频或
+  保护频段且违规，则任何 `x` 都无法消除，直接**无可行位置**；若它本身不违规但可能命中
+  新载频（`|2·fa−fb−x| < g`），对应 `x` 位置同样禁用。
+- **区间反解而非逐 Hz 枚举**：含 x 的产物 `2·x−c` 与 `2·c−x`（c 为其余载频）到其余载频/
+  保护频段的命中约束，以及产物对新载频 x 自身的命中约束（含镜像产物落在扫描范围外的情况），
+  都反解为关于 x 的线性整数闭区间（开区间整数点内缩 1 Hz；除以 2 时起点向上、终点向下取整），
+  再加上其余载频的单点禁用，裁剪到候选范围后合并重叠或相邻区间，在空隙中选解。候选范围很宽
+  （如 10¹⁰ Hz）也不产生逐 Hz 开销。
+- **选点规则**：返回候选范围内**距 `old_hz` 最近**的可行整数频率，**等距时取较小值**；
+  `old_hz` 本身可行（且候选范围包含它）时返回 `old_hz`。候选区间内无可行位置时返回
+  `feasible=false`、`new_hz=null`。
+
+请求与响应示例（载频 `[100, 300, 500]`、无保护频段、`guard_interval_hz=50`：未变产物
+`2·300−500=100` 使 `x∈[51,149]` 因命中新载频被禁用，50 与 150 等距取 50）：
+
+```bash
+curl -X POST http://localhost:8000/sites/1/carrier-relocation \
+  -H 'Content-Type: application/json' \
+  -d '{"old_hz": 100, "start_hz": 1, "end_hz": 1000}'
+```
+
+```json
+{
+  "site_id": 1,
+  "old_hz": 100,
+  "start_hz": 1,
+  "end_hz": 1000,
+  "feasible": true,
+  "new_hz": 50
+}
+```
+
+无可行位置时（例如下例中迁移 100 后，未变来源 `(400, 300)` 的产物 500 仍落在保护频段
+`[480, 520]` 内，与 x 无关；载频 `[100, 300, 400]`、`guard_interval_hz=150`）：
+
+```bash
+curl -X POST http://localhost:8000/sites/1/carrier-relocation \
+  -H 'Content-Type: application/json' \
+  -d '{"old_hz": 100, "start_hz": 1, "end_hz": 10000}'
+```
+
+```json
+{
+  "site_id": 1,
+  "old_hz": 100,
+  "start_hz": 1,
+  "end_hz": 10000,
+  "feasible": false,
+  "new_hz": null
+}
+```
+
 ## 载频漂移风险评估（drift risk）
 
 `POST /sites/{site_id}/drift-risk` 评估载频独立漂移下全频域的潜在互调风险，
@@ -455,6 +518,7 @@ curl 'http://localhost:8000/sites/1/risk-history?limit=10'
 | `GET` | `/sites` | 列出全部已保存方案 |
 | `GET` | `/sites/{site_id}` | 查询单个已保存方案 |
 | `GET` | `/sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b` | 候选闭区间内不宜新增载频的最小区间并集（不执行或保存分析） |
+| `POST` | `/sites/{site_id}/carrier-relocation` | 单载频迁移规划：候选整数闭区间内距 old_hz 最近的可行位置（等距取小），线性约束反解不逐 Hz 枚举，不修改站点或保存分析；old_hz 不存在或区间非法 → 422，站点不存在 → 404，无可行位置时 `feasible=false` |
 | `POST` | `/sites/{site_id}/drift-risk` | 载频独立漂移下的全频域潜在互调风险评估（不保存分析；映射缺失/重复/多余或容差非法 → 422，站点不存在 → 404） |
 | `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201`；可选 `Idempotency-Key` 请求头：同站点重复/并发同键返回首次结果（`200`）且不新增记录，空白键 `422` |
 | `POST` | `/sites/analyses/batch` | 多站点原子批量分析：1～10 个不重复站点 ID 按输入顺序逐站分析并在同一事务内保存，`201` 返回同序结果列表；任一站点不存在 → `404` 且整批不保存，任一步骤失败整批回滚 |
@@ -515,6 +579,11 @@ curl 'http://localhost:8000/analyses/1/mitigation-plan?max_disabled=2'
 
 # 查询候选范围 [1, 10000] 内不宜新增载频的区间（不执行或保存分析）
 curl 'http://localhost:8000/sites/1/carrier-exclusion-ranges?candidate_start_hz=1&candidate_end_hz=10000'
+
+# 单载频迁移规划：把载频 100 替换为候选 [1,1000] 内距它最近的可行位置（不修改站点、不保存分析）
+curl -X POST http://localhost:8000/sites/1/carrier-relocation \
+  -H 'Content-Type: application/json' \
+  -d '{"old_hz": 100, "start_hz": 1, "end_hz": 1000}'
 
 # 载频漂移风险评估（每个载频给出容差，不保存分析）
 curl -X POST http://localhost:8000/sites/1/drift-risk \
@@ -595,8 +664,9 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（90 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
-# 新增载频禁用区间、载频漂移风险评估、跨站点冲突检测，幂等键的重复重放、失败回滚与并发去重，
+# 运行测试（102 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
+# 新增载频禁用区间、单载频迁移规划（含等距取小、无解、未变来源产物命中新载频与随机暴力枚举对照）、
+# 载频漂移风险评估、跨站点冲突检测，幂等键的重复重放、失败回滚与并发去重，
 # 多站点原子批量分析的顺序一致、404 整批不保存与失败整批回滚，
 # 分析历史保留清理的倒序保留、幂等键联动删除与整批回滚，
 # 以及站点历史风险的窗口选取、违规计数、连续计数终止与参数校验）
@@ -616,8 +686,8 @@ uvicorn app.main:app --reload
 
 ```
 app/
-  main.py       # FastAPI 应用与路由，启动时初始化数据库（含单站分析与多站点原子批量分析、站点历史风险查询）
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合、站点历史风险汇总
+  main.py       # FastAPI 应用与路由，启动时初始化数据库（含单站分析与多站点原子批量分析、单载频迁移规划、站点历史风险查询）
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、单载频迁移规划（线性约束反解与禁用区间合并）、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合、站点历史风险汇总
   database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、多站点批量分析单事务提交、历史保留单事务清理、最近分析窗口读取、跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

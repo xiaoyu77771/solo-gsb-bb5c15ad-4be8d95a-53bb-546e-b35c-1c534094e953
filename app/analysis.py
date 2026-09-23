@@ -5,6 +5,7 @@ from typing import Sequence
 
 from .schemas import (
     AnalysisResult,
+    CarrierRelocationResult,
     ConflictCluster,
     ConflictPair,
     ConflictProduct,
@@ -733,6 +734,182 @@ def carrier_exclusion_ranges(
         else:
             merged.append(ExclusionRange(start_hz=lo, end_hz=hi))
     return merged
+
+
+def plan_carrier_relocation(
+    carriers_hz: list[int],
+    scan_start_hz: int,
+    scan_end_hz: int,
+    guard_bands: list[GuardBand],
+    guard_interval_hz: int,
+    old_hz: int,
+    start_hz: int,
+    end_hz: int,
+    site_id: int = 0,
+) -> CarrierRelocationResult | None:
+    """把载频 old_hz 替换为候选 x 的迁移规划（不修改站点、不保存分析）。
+
+    返回结果对象；old_hz 不是站点载频时返回 None（由路由层映射为 422）。
+
+    迁移后的载频集合为 C = 其余载频 R ∪ {x}，按与 analyze 完全相同的语义
+    判定可接受性：枚举 C 中 fa != fb 的有序来源产物 p = 2*fa - fb，落在扫描
+    范围 [scan_start_hz, scan_end_hz] 内时，到 C 中任一载频或保护频段的距离
+    严格小于 guard_interval_hz 即违规；全部产物不违规且 x 不在 R 中才可接受。
+
+    全部约束都按 x 的线性形式反解为整数闭区间后合并，不逐 Hz 枚举：
+      1. 未变来源 (fa, fb ∈ R) 产生的扫描范围内产物，其到固定对象（其余载频
+         与保护频段）的距离与 x 无关——该距离小于 g 时任何 x 都无法消除，
+         直接无解；否则该产物仍可能命中新载频 x（|2fa-fb-x| < g），把对应
+         的禁用位置计入区间。
+      2. 含 x 的来源 (x, c) 与 (c, x)（c ∈ R）产生两类产物 2*x-c 与 2*c-x：
+         对其余载频/保护频段的命中由违规产物区（开区间的整数点）按两种公式
+         反解 x 区间（除以 2 时起点向上、终点向下取整）；对新载频 x 自身的
+         命中（|x-c| < g 且相应产物落在扫描范围内）同样反解为区间，处理
+         另一个镜像产物落在扫描范围外、仅一侧被区反解覆盖的情况。
+      3. x 与其余载频重复：把每个 c ∈ R 的单点 {c} 计入禁用区间。
+    区间裁剪到候选闭区间 [start_hz, end_hz] 后合并重叠或相邻区间，可行位置
+    即剩余空隙；返回距 old_hz 最近者，等距时取较小值；无空隙时无解。
+    """
+    if old_hz not in carriers_hz:
+        return None
+    remaining = [c for c in carriers_hz if c != old_hz]
+    g = guard_interval_hz
+
+    # 违规产物位置（扫描范围内的整数 Hz 闭区间）：到载频 f 距离 < g 即
+    # 开区间 (f-g, f+g) 的整数点 [f-g+1, f+g-1]；到保护频段 [s, e] 距离
+    # < g 即 (s-g, e+g) 的整数点。g = 0 时无违规产物位置。
+    zones: list[tuple[int, int]] = []
+    if g > 0:
+        raw = [(f - g + 1, f + g - 1) for f in remaining]
+        raw += [(b.start_hz - g + 1, b.end_hz + g - 1) for b in guard_bands]
+        for lo, hi in raw:
+            lo, hi = max(lo, scan_start_hz), min(hi, scan_end_hz)
+            if lo <= hi:
+                zones.append((lo, hi))
+
+    intervals: list[tuple[int, int]] = []
+
+    # ---- 未变来源（fa, fb ∈ R）的产物
+    unchanged_products: set[int] = set()
+    for fa in remaining:
+        for fb in remaining:
+            if fa == fb:
+                continue
+            p = 2 * fa - fb
+            if scan_start_hz <= p <= scan_end_hz:
+                unchanged_products.add(p)
+    for p in unchanged_products:
+        distance, _ = nearest_hit(p, remaining, guard_bands)
+        if distance < g:
+            # 命中其余载频或保护频段且违规：与 x 无关，任何迁移位置都无法
+            # 消除该产物（old_hz 已从命中对象中移除）。
+            return CarrierRelocationResult(
+                site_id=site_id,
+                old_hz=old_hz,
+                start_hz=start_hz,
+                end_hz=end_hz,
+                feasible=False,
+                new_hz=None,
+            )
+        # 到固定对象均不违规时，仍可能命中新载频 x：|p - x| < g
+        # -> x ∈ [p-g+1, p+g-1]。
+        if g > 0:
+            intervals.append((p - g + 1, p + g - 1))
+
+    # ---- 含 x 的来源（(x,c) 与 (c,x)）与其余载频/保护频段的命中
+    for c in remaining:
+        for p_lo, p_hi in zones:
+            # p = 2*x - c ∈ [p_lo, p_hi]
+            #   -> x ∈ [ceil((p_lo+c)/2), floor((p_hi+c)/2)]
+            lo = -(-(p_lo + c) // 2)
+            hi = (p_hi + c) // 2
+            if lo <= hi:
+                intervals.append((lo, hi))
+            # p = 2*c - x ∈ [p_lo, p_hi] -> x ∈ [2*c-p_hi, 2*c-p_lo]
+            lo, hi = 2 * c - p_hi, 2 * c - p_lo
+            if lo <= hi:
+                intervals.append((lo, hi))
+
+        # ---- 产物命中新载频 x 自身：|x - c| < g，且相应产物在扫描范围内。
+        # 区反解只覆盖“镜像产物 2*c-x 也落在扫描范围内”的部分；镜像产物
+        # 落在扫描范围外时，仍须按本侧产物的扫描范围反解。
+        if g > 0:
+            near_lo, near_hi = c - g + 1, c + g - 1
+            # p = 2*x - c 在扫描范围内 <-> x ∈ [ceil((S+c)/2), floor((E+c)/2)]
+            lo = -(-(scan_start_hz + c) // 2)
+            hi = (scan_end_hz + c) // 2
+            lo, hi = max(lo, near_lo), min(hi, near_hi)
+            if lo <= hi:
+                intervals.append((lo, hi))
+            # p = 2*c - x 在扫描范围内 <-> x ∈ [2*c-E, 2*c-S]
+            lo, hi = 2 * c - scan_end_hz, 2 * c - scan_start_hz
+            lo, hi = max(lo, near_lo), min(hi, near_hi)
+            if lo <= hi:
+                intervals.append((lo, hi))
+
+    # ---- x 不得与其余载频重复
+    intervals.extend((c, c) for c in remaining)
+
+    merged = _clip_merge_intervals(intervals, start_hz, end_hz)
+    new_hz = _nearest_allowed(merged, start_hz, end_hz, old_hz)
+    return CarrierRelocationResult(
+        site_id=site_id,
+        old_hz=old_hz,
+        start_hz=start_hz,
+        end_hz=end_hz,
+        feasible=new_hz is not None,
+        new_hz=new_hz,
+    )
+
+
+def _clip_merge_intervals(
+    intervals: list[tuple[int, int]], low: int, high: int
+) -> list[tuple[int, int]]:
+    """裁剪到整数闭区间 [low, high] 并合并重叠或相邻区间，按起点升序返回。"""
+    clipped: list[tuple[int, int]] = []
+    for lo, hi in intervals:
+        lo, hi = max(lo, low), min(hi, high)
+        if lo <= hi:
+            clipped.append((lo, hi))
+    clipped.sort()
+    merged: list[tuple[int, int]] = []
+    for lo, hi in clipped:
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _nearest_allowed(
+    forbidden: list[tuple[int, int]],
+    low: int,
+    high: int,
+    target: int,
+) -> int | None:
+    """返回 [low, high] 中不落在禁用区间（已裁剪合并）且距 target 最近的整数。
+
+    可行位置是禁用区间之间（以及两端）的空隙；只检查各空隙边界，不逐 Hz
+    枚举。等距时取较小值。
+    """
+    best: int | None = None
+    cursor = low
+
+    def consider(value: int) -> None:
+        nonlocal best
+        if best is None or abs(value - target) < abs(best - target) or (
+            abs(value - target) == abs(best - target) and value < best
+        ):
+            best = value
+
+    for lo, hi in forbidden:
+        if cursor < lo:
+            # 空隙 [cursor, lo-1]：距 target 最近的位置为 target 夹到空隙内
+            consider(min(max(target, cursor), lo - 1))
+        cursor = max(cursor, hi + 1)
+    if cursor <= high:
+        consider(min(max(target, cursor), high))
+    return best
 
 
 def drift_risk_assessment(
