@@ -14,6 +14,7 @@ from .analysis import (
     build_risk_groups,
     build_risk_history,
     carrier_exclusion_ranges,
+    carrier_relocation,
     drift_risk_assessment,
 )
 from .schemas import (
@@ -21,6 +22,8 @@ from .schemas import (
     AnalysisResult,
     BatchAnalysisRequest,
     CarrierExclusionResult,
+    CarrierRelocationRequest,
+    CarrierRelocationResult,
     CrossSiteConflictsRequest,
     CrossSiteConflictsResponse,
     DriftRiskRequest,
@@ -179,6 +182,54 @@ def evaluate_drift_risk(site_id: int, payload: DriftRiskRequest) -> DriftRiskRes
         guard_interval_hz=site.guard_interval_hz,
         risk_count=len(risks),
         risks=risks,
+    )
+
+
+@app.post(
+    "/sites/{site_id}/carrier-relocation",
+    response_model=CarrierRelocationResult,
+    tags=["sites"],
+    summary="单载频迁移规划：求距 old_hz 最近的可行替换频率（不修改站点、不保存分析）",
+    description=(
+        "将现有载频 old_hz 替换为候选闭区间 [start_hz, end_hz] 内的整数频率 x，"
+        "按与分析一致的语义（现有扫描范围、三阶产物 2fa−fb、严格保护间隔）判定"
+        "新载频集合：全部产物均不违规且 x 不与其余载频重复时 x 可行。约束全部"
+        "反解为关于 x 的线性禁用整数区间并合并（含未变来源产物命中新载频的"
+        "情况），不逐 Hz 枚举。返回距 old_hz 最近的可行频率（等距取较小值）；"
+        "无可行位置时 feasible=false 且 new_hz 为 null。old_hz 不是该站点载频"
+        "或区间无效（start_hz 大于 end_hz）返回 422，站点不存在返回 404。"
+        "不修改站点配置，也不保存分析。"
+    ),
+)
+def plan_carrier_relocation(
+    site_id: int, payload: CarrierRelocationRequest
+) -> CarrierRelocationResult:
+    site = database.fetch_site(site_id)
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
+    if payload.old_hz not in site.carriers_hz:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"old_hz {payload.old_hz} is not a carrier of site {site_id}",
+        )
+    new_hz = carrier_relocation(
+        carriers_hz=site.carriers_hz,
+        old_hz=payload.old_hz,
+        scan_start_hz=site.scan_start_hz,
+        scan_end_hz=site.scan_end_hz,
+        guard_bands=site.guard_bands,
+        guard_interval_hz=site.guard_interval_hz,
+        start_hz=payload.start_hz,
+        end_hz=payload.end_hz,
+    )
+    return CarrierRelocationResult(
+        site_id=site_id,
+        old_hz=payload.old_hz,
+        start_hz=payload.start_hz,
+        end_hz=payload.end_hz,
+        feasible=new_hz is not None,
+        new_hz=new_hz,
+        distance_hz=abs(new_hz - payload.old_hz) if new_hz is not None else None,
     )
 
 

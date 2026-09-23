@@ -735,6 +735,126 @@ def carrier_exclusion_ranges(
     return merged
 
 
+def carrier_relocation(
+    carriers_hz: list[int],
+    old_hz: int,
+    scan_start_hz: int,
+    scan_end_hz: int,
+    guard_bands: list[GuardBand],
+    guard_interval_hz: int,
+    start_hz: int,
+    end_hz: int,
+) -> int | None:
+    """反解单载频迁移的可行位置：距 old_hz 最近的可行频率（等距取较小值）。
+
+    把 old_hz 替换为候选整数 x ∈ [start_hz, end_hz] 后，新载频集合
+    R ∪ {x}（R 为其余载频）按与分析一致的语义判定：每个落在扫描范围
+    [scan_start_hz, scan_end_hz] 内的三阶产物 2*fa - fb（fa ≠ fb），到
+    任一（新）载频或保护频段的距离都不得严格小于 guard_interval_hz，
+    且 x 不得与 R 中载频重复。
+
+    全部约束反解为关于 x 的禁用整数区间再合并，不逐 Hz 枚举：
+    - x 与 R 中载频重复：单点禁用；
+    - 未变来源产物 p = 2a - b（a, b ∈ R）落在扫描范围内：若 p 到 R 与
+      保护频段的距离已违规，则任何 x 都不可行（直接返回 None）；否则
+      禁用 |p - x| < g 的位置（未变来源产物命中新载频）；
+    - 含 x 的产物 2x - c 与 2c - x（c ∈ R）：仅在产物落在扫描范围内的
+      x 窗口内，分别按“到 x 本身 / 到其余载频 / 到保护频段的距离 < g”
+      反解线性约束（开区间 (ref-g, ref+g) 的整数点端点内缩 1 Hz；含 2x
+      的约束除以 2 时起点向上取整、终点向下取整）。
+
+    禁用区间裁剪到候选范围并合并重叠或相邻（整数 Hz 下起点相差 <= 1）
+    区间后，在可行缺口中取距 old_hz 最近的整数（等距取较小值）；无可行
+    位置时返回 None。
+    """
+    remaining = [c for c in carriers_hz if c != old_hz]
+    g = guard_interval_hz
+    forbidden: list[tuple[int, int]] = [(c, c) for c in remaining]
+
+    if g > 0:
+        # 未变来源产物 p = 2a - b（a, b ∈ R）：p 到 R ∪ 保护频段的距离与
+        # x 无关，已违规时任何 x 都不可行；否则禁用会被新载频 x 命中的位置。
+        for a in remaining:
+            for b in remaining:
+                if a == b:
+                    continue
+                p = 2 * a - b
+                if not scan_start_hz <= p <= scan_end_hz:
+                    continue
+                fixed = min(
+                    [abs(p - c) for c in remaining]
+                    + [_distance_to_guard_band(p, band) for band in guard_bands]
+                )
+                if fixed < g:
+                    return None
+                forbidden.append((p - g + 1, p + g - 1))
+
+        for c in remaining:
+            # 产物 2x - c 的扫描窗口：x ∈ [ceil((S+c)/2), floor((E+c)/2)]
+            win_lo = -(-(scan_start_hz + c) // 2)
+            win_hi = (scan_end_hz + c) // 2
+            zones = [(c - g + 1, c + g - 1)]  # 到 x 本身：|x - c| < g
+            for c2 in remaining:  # 到 c2：|2x - (c + c2)| < g
+                k = c + c2
+                zones.append((-(-(k - g + 1) // 2), (k + g - 1) // 2))
+            for band in guard_bands:  # 到频段：2x - c ∈ (s-g, e+g)
+                zones.append(
+                    (
+                        -(-(c + band.start_hz - g + 1) // 2),
+                        (c + band.end_hz + g - 1) // 2,
+                    )
+                )
+            for lo, hi in zones:
+                lo, hi = max(lo, win_lo), min(hi, win_hi)
+                if lo <= hi:
+                    forbidden.append((lo, hi))
+
+            # 产物 2c - x 的扫描窗口：x ∈ [2c-E, 2c-S]
+            win_lo, win_hi = 2 * c - scan_end_hz, 2 * c - scan_start_hz
+            half = (g - 1) // 2  # 到 x 本身：2|x - c| < g
+            zones = [(c - half, c + half)]
+            for c2 in remaining:  # 到 c2：|x - (2c - c2)| < g
+                zones.append((2 * c - c2 - g + 1, 2 * c - c2 + g - 1))
+            for band in guard_bands:  # 到频段：x ∈ (2c-e-g, 2c-s+g)
+                zones.append(
+                    (2 * c - band.end_hz - g + 1, 2 * c - band.start_hz + g - 1)
+                )
+            for lo, hi in zones:
+                lo, hi = max(lo, win_lo), min(hi, win_hi)
+                if lo <= hi:
+                    forbidden.append((lo, hi))
+
+    # 裁剪到候选范围，合并重叠或相邻区间（结果按起点升序）
+    clipped: list[tuple[int, int]] = []
+    for lo, hi in forbidden:
+        lo, hi = max(lo, start_hz), min(hi, end_hz)
+        if lo <= hi:
+            clipped.append((lo, hi))
+    clipped.sort()
+    merged: list[list[int]] = []
+    for lo, hi in clipped:
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+
+    # 逐可行缺口取距 old_hz 最近的整数（等距取较小值）
+    best: int | None = None
+    cursor = start_hz
+    gaps: list[tuple[int, int]] = []
+    for lo, hi in merged:
+        if cursor < lo:
+            gaps.append((cursor, lo - 1))
+        cursor = max(cursor, hi + 1)
+    if cursor <= end_hz:
+        gaps.append((cursor, end_hz))
+    for gap_lo, gap_hi in gaps:
+        cand = min(max(old_hz, gap_lo), gap_hi)
+        if best is None or (abs(cand - old_hz), cand) < (abs(best - old_hz), best):
+            best = cand
+    return best
+
+
 def drift_risk_assessment(
     carriers_hz: list[int],
     tolerances_hz: dict[int, int],

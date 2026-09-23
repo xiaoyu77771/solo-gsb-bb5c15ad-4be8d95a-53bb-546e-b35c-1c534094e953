@@ -859,6 +859,194 @@ def test_carrier_exclusion_ranges_does_not_save_analysis(client):
     assert client.get("/sites/1/analyses").json() == []
 
 
+# ---------------------------------------------------------------- 单载频迁移规划
+
+def _reloc_body(old_hz, start_hz, end_hz):
+    return {"old_hz": old_hz, "start_hz": start_hz, "end_hz": end_hz}
+
+
+def test_carrier_relocation_nearest_feasible_below_old(client):
+    # 载频 [1000, 1100]、g=150：替换 1000 时禁用区间为 [951,1249]
+    # （产物 2x-1100 与 2200-x 到 x 本身/载频 1100 的距离约束合并），
+    # 候选 [1,3000] 内距 1000 最近的可行位置为 950（距离恰为 150 不违规）
+    client.post("/sites", json=make_payload(carriers_hz=[1000, 1100]))
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(1000, 1, 3000))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "site_id": 1,
+        "old_hz": 1000,
+        "start_hz": 1,
+        "end_hz": 3000,
+        "feasible": True,
+        "new_hz": 950,
+        "distance_hz": 50,
+    }
+    # 951 不可行（2*951-1100=802 距新载频 951 为 149 < 150），950 两侧最近
+
+
+def test_carrier_relocation_unchanged_source_product_hits_new_carrier(client):
+    # 载频 [700, 1000, 1300]、g=150，替换 700。未变来源产物 2*1000-1300=700
+    # 自身不违规（距 1000 为 300），但会命中落在 (550, 850) 内的新载频，
+    # 禁用 [551,849]；与其余约束合并后可行缺口为 [1,550]、[850,850]、
+    # [1750,3000]。550 与 850 距 old_hz=700 同为 150，等距取较小值 550
+    client.post("/sites", json=make_payload(carriers_hz=[700, 1000, 1300]))
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(700, 1, 3000))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["new_hz"] == 550
+    assert resp.json()["distance_hz"] == 150
+
+    # 边界开区间：x=551 时产物 700 距新载频为 149 < 150 -> 违规，单点候选无可行位置
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(700, 551, 551))
+    assert resp.json()["feasible"] is False
+    assert resp.json()["new_hz"] is None
+    # x=550 时产物 700 距新载频恰为 150，不违规
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(700, 550, 550))
+    assert resp.json()["feasible"] is True
+    assert resp.json()["new_hz"] == 550
+
+
+def test_carrier_relocation_infeasible_when_remaining_carriers_violate(client):
+    # 载频 [300, 400, 1000]、g=150，替换 1000：未变来源产物 2*300-400=200
+    # 距载频 300 为 100 < 150，与 x 无关地违规 -> 任何 x 都不可行
+    client.post("/sites", json=make_payload(carriers_hz=[300, 400, 1000]))
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(1000, 1, 5000))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "site_id": 1,
+        "old_hz": 1000,
+        "start_hz": 1,
+        "end_hz": 5000,
+        "feasible": False,
+        "new_hz": None,
+        "distance_hz": None,
+    }
+
+
+def test_carrier_relocation_duplicate_of_remaining_carrier_forbidden(client):
+    # 候选区间退化为其余载频本身（5000）：唯一点与其余载频重复 -> 无可行位置
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 5000], scan_end_hz=100000, guard_interval_hz=10,
+    ))
+    resp = client.post(
+        "/sites/1/carrier-relocation", json=_reloc_body(1000, 5000, 5000)
+    )
+    assert resp.status_code == 200
+    assert resp.json()["feasible"] is False
+    assert resp.json()["new_hz"] is None
+
+
+def test_carrier_relocation_respects_scan_range_window(client):
+    # 扫描范围 [1,3000]：x≈5000 时产物 2x-5000≈5000 与 10000-x≈5000 都落在
+    # 扫描范围外，不产生约束；候选 [4990,4995] 全部可行，取距 1000 最近的 4990
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 5000], scan_end_hz=3000, guard_interval_hz=10,
+    ))
+    resp = client.post(
+        "/sites/1/carrier-relocation", json=_reloc_body(1000, 4990, 4995)
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["feasible"] is True
+    assert resp.json()["new_hz"] == 4990
+    assert resp.json()["distance_hz"] == 3990
+
+
+def test_carrier_relocation_guard_band_constraint(client):
+    # 载频 [1000, 2000]、保护频段 [480,520]、g=150，替换 2000：
+    # 禁用区间 [666,834]（产物 2x-1000 命中频段）、[851,1149]、
+    # [1331,1669]（产物 2000-x 命中频段）；候选 [1150,1670] 内可行缺口为
+    # [1150,1330] 与单点 1670，距 2000 最近的可行位置为 1670
+    # （产物 2*1000-1670=330 距频段恰为 150，不违规）
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 2000],
+        guard_bands=[{"start_hz": 480, "end_hz": 520}],
+    ))
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(2000, 1150, 1670))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["new_hz"] == 1670
+    assert resp.json()["distance_hz"] == 330
+
+
+def test_carrier_relocation_zero_guard_interval(client):
+    # g=0：任何产物都不违规，仅其余载频点禁用；候选 [101,104] 内 101 禁用，
+    # 距 old_hz=105 最近的可行位置为 104
+    client.post("/sites", json=make_payload(
+        carriers_hz=[100, 101, 105], guard_interval_hz=0,
+    ))
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(105, 101, 104))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["new_hz"] == 104
+    assert resp.json()["distance_hz"] == 1
+
+
+def test_carrier_relocation_single_carrier_site(client):
+    # 单载频站点替换后无任何产物：候选区间全部可行，取距 old_hz 最近的端点
+    client.post("/sites", json=make_payload(carriers_hz=[500], guard_interval_hz=100))
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(500, 600, 900))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["new_hz"] == 600
+    assert resp.json()["distance_hz"] == 100
+
+
+def test_carrier_relocation_old_position_stays_feasible(client):
+    # 当前配置本无违规且 old_hz 在候选区间内：最近可行位置即 old_hz 本身
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 5000], scan_end_hz=100000, guard_interval_hz=10,
+    ))
+    resp = client.post(
+        "/sites/1/carrier-relocation", json=_reloc_body(1000, 1, 100000)
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["new_hz"] == 1000
+    assert resp.json()["distance_hz"] == 0
+
+
+def test_carrier_relocation_404_missing_site(client):
+    resp = client.post("/sites/999/carrier-relocation", json=_reloc_body(100, 1, 200))
+    assert resp.status_code == 404
+
+
+def test_carrier_relocation_422_old_hz_not_a_carrier(client):
+    client.post("/sites", json=make_payload())  # 载频 [100, 300, 400]
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(999, 1, 1000))
+    assert resp.status_code == 422
+    assert "999" in resp.json()["detail"]
+    # 站点不存在与 old_hz 非法同时出现时，站点不存在优先返回 404
+    assert (
+        client.post("/sites/999/carrier-relocation", json=_reloc_body(999, 1, 1000))
+        .status_code
+        == 404
+    )
+
+
+def test_carrier_relocation_422_validation(client):
+    client.post("/sites", json=make_payload())
+    url = "/sites/1/carrier-relocation"
+    # 区间无效：起点大于终点
+    assert client.post(url, json=_reloc_body(100, 200, 100)).status_code == 422
+    # 非正整数 / 非整数 / 缺失字段 / 缺整个请求体
+    assert client.post(url, json=_reloc_body(0, 1, 100)).status_code == 422
+    assert client.post(url, json=_reloc_body(100, 0, 100)).status_code == 422
+    assert client.post(url, json=_reloc_body(100, 1, -5)).status_code == 422
+    assert client.post(url, json=_reloc_body(100, 1.5, 100)).status_code == 422
+    assert client.post(url, json=_reloc_body(100, "x", 100)).status_code == 422
+    assert client.post(url, json={"old_hz": 100, "start_hz": 1}).status_code == 422
+    assert client.post(url, json={"start_hz": 1, "end_hz": 100}).status_code == 422
+    assert client.post(url).status_code == 422
+    # 起点等于终点合法（候选区间退化为单点）
+    ok = client.post(url, json=_reloc_body(400, 700, 700))
+    assert ok.status_code == 200
+    assert ok.json()["new_hz"] == 700
+
+
+def test_carrier_relocation_does_not_modify_site_or_save_analysis(client):
+    # 该端点不修改站点配置、不保存分析：调用前后站点与分析记录完全不变
+    client.post("/sites", json=make_payload())
+    before = client.get("/sites/1").json()
+    resp = client.post("/sites/1/carrier-relocation", json=_reloc_body(400, 1, 10000))
+    assert resp.status_code == 200
+    assert client.get("/sites/1").json() == before
+    assert client.get("/sites/1/analysis").status_code == 404
+    assert client.get("/sites/1/analyses").json() == []
 
 
 def _create_and_analyze(client, **payload_overrides):
