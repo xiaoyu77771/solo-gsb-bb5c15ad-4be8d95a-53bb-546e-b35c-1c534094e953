@@ -1,0 +1,20 @@
+services:
+  api:
+    build: .
+    image: rf-intermod-api
+    ports:
+      - "8000:8000"
+    environment:
+      IMD_DB_PATH: /data/intermod.db
+    volumes:
+      - imd-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  imd-data:
